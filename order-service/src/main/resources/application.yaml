@@ -1,0 +1,21 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:postgresql://localhost:5433/orders
+    username: postgres
+    password: postgres
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  rabbitmq:
+    host: localhost
+    port: 5672
+  web:
+    error:
+      include-binding-errors: always
+      include-message: always
