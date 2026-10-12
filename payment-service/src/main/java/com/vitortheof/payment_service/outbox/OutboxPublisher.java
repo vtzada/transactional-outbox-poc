@@ -12,6 +12,7 @@ import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.core.NestedExceptionUtils;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -38,7 +39,8 @@ public class OutboxPublisher {
                 evento.marcarComoPublicado();
                 log.info("Evento {} publicado", evento.getId());
             } catch (Exception e) {
-                log.warn("Falha ao publicar o evento {}: {}. Nova tentativa no próximo ciclo.", evento.getId(), e.getMessage());
+                log.warn("Falha ao publicar o evento {}: {}. Nova tentativa no próximo ciclo.",
+                        evento.getId(), NestedExceptionUtils.getMostSpecificCause(e).toString());
                 break;
             }
         }

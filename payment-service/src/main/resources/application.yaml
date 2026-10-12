@@ -16,3 +16,9 @@ spring:
     host: localhost
     port: 5672
     publisher-confirm-type: correlated
+
+outbox:
+  limpeza:
+    cron: "0 0 3 * * *"
+    retencao: 7d
+    tamanho-lote: 1000
