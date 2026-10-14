@@ -18,6 +18,8 @@ spring:
     publisher-confirm-type: correlated
 
 outbox:
+  publicacao:
+    modo: debezium # polling ou debezium
   limpeza:
     cron: "0 0 3 * * *"
     retencao: 7d

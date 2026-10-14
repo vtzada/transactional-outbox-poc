@@ -29,17 +29,26 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.reset;
 
-@SpringBootTest(properties = "outbox.agendamento.habilitado=false")
+@SpringBootTest(properties = {
+        "outbox.agendamento.habilitado=false",
+        "outbox.publicacao.modo=polling"
+})
 @Import(TestcontainersConfiguration.class)
 class TransactionalOutboxTest {
 
-    @Autowired PagamentoService pagamentoService;
-    @Autowired PagamentoRepository pagamentoRepository;
-    @Autowired OutboxPublisher publisher;
-    @Autowired AmqpAdmin amqpAdmin;
+    @Autowired
+    PagamentoService pagamentoService;
+    @Autowired
+    PagamentoRepository pagamentoRepository;
+    @Autowired
+    OutboxPublisher publisher;
+    @Autowired
+    AmqpAdmin amqpAdmin;
 
-    @MockitoSpyBean OutboxEventRepository outboxRepository;
-    @MockitoSpyBean RabbitTemplate rabbitTemplate;
+    @MockitoSpyBean
+    OutboxEventRepository outboxRepository;
+    @MockitoSpyBean
+    RabbitTemplate rabbitTemplate;
 
     @BeforeEach
     void limparBanco() {

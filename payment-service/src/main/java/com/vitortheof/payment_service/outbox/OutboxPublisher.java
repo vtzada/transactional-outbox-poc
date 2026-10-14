@@ -10,6 +10,7 @@ import org.springframework.amqp.core.MessageBuilder;
 import org.springframework.amqp.core.MessageProperties;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.core.NestedExceptionUtils;
@@ -20,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 
 @RequiredArgsConstructor
 @Component
+@ConditionalOnProperty(name = "outbox.publicacao.modo", havingValue = "polling", matchIfMissing = true)
 public class OutboxPublisher {
 
     private static final Logger log = LoggerFactory.getLogger(OutboxPublisher.class);

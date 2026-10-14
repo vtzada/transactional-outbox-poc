@@ -4,6 +4,7 @@ import com.vitortheof.payment_service.domain.Pagamento;
 import com.vitortheof.payment_service.event.PagamentoAprovadoEvent;
 import com.vitortheof.payment_service.outbox.OutboxEvent;
 import com.vitortheof.payment_service.outbox.OutboxEventRepository;
+import com.vitortheof.payment_service.outbox.OutboxRegistrador;
 import com.vitortheof.payment_service.repository.PagamentoRepository;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
@@ -18,7 +19,7 @@ import java.util.UUID;
 public class PagamentoService {
 
     private final PagamentoRepository pagamentoRepository;
-    private final OutboxEventRepository outboxEventRepository;
+    private final OutboxRegistrador outboxRegistrador;
     private final ObjectMapper objectMapper;
 
     @Transactional
@@ -34,7 +35,7 @@ public class PagamentoService {
         //converter o evento em json para armazena-lo na outbox;
         String payload = objectMapper.writeValueAsString(evento);
         //registra oevento como pendente na msm transação do pagamento.
-        outboxEventRepository.save(OutboxEvent.pendente(eventId, pagamento.getId(), "PagamentoAprovado", payload));
+        outboxRegistrador.registrar(OutboxEvent.pendente(eventId, pagamento.getId(), "PagamentoAprovado", payload));
 
 
         return pagamento;
