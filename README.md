@@ -1,8 +1,13 @@
-# Transactional Outbox — Spring Boot, PostgreSQL e RabbitMQ
+# Transactional Outbox — Spring Boot, PostgreSQL, RabbitMQ e Debezium
 
-![Transactional Outbox](docs/transactional-outbox.gif)
+![Transactional Outbox com Debezium](docs/transactional-outbox-debezium.gif)
 
 POC do padrão **Transactional Outbox** aplicado a um fluxo de pagamento PIX entre dois microsserviços: o `payment-service` aprova o pagamento e o `order-service` marca o pedido como pago.
+
+O projeto implementa as duas formas de levar o evento até o broker, selecionáveis por configuração:
+
+- **Parte 1 — polling:** um worker consulta a tabela de outbox periodicamente.
+- **Parte 2 — CDC com Debezium:** o evento é capturado direto do WAL do PostgreSQL.
 
 > Quando o RabbitMQ falha, o evento não pode desaparecer.
 
@@ -22,7 +27,7 @@ Colocar o `rabbitTemplate.send(...)` dentro de um método `@Transactional` não 
 
 ## A solução
 
-O evento é gravado numa tabela `outbox_events`, no **mesmo banco e na mesma transação** do pagamento. Ou os dois existem, ou nenhum. Publicar no RabbitMQ vira uma tarefa separada, feita por um worker que lê a outbox.
+O evento é gravado numa tabela `outbox_events`, no **mesmo banco e na mesma transação** do pagamento. Ou os dois existem, ou nenhum. Publicar no RabbitMQ vira uma tarefa separada: na parte 1, um worker que lê a outbox; na parte 2, o Debezium lendo o WAL.
 
 ```mermaid
 flowchart LR
@@ -41,9 +46,11 @@ flowchart LR
 
 ## Stack
 
-Java 21 · Spring Boot 4 · Spring Data JPA · PostgreSQL 16 · Flyway · RabbitMQ · Docker Compose · JUnit 5 · Testcontainers
+Java 21 · Spring Boot 4 · Spring Data JPA · PostgreSQL 16 · Flyway · RabbitMQ · Debezium Server 3.3 · Docker Compose · JUnit 5 · Testcontainers
 
-## Como funciona
+## Parte 1: polling
+
+![Transactional Outbox com polling](docs/transactional-outbox.gif)
 
 ### 1. Gravação atômica (`payment-service`)
 
@@ -84,6 +91,105 @@ outbox:
     tamanho-lote: 1000
 ```
 
+## Parte 2: CDC com Debezium
+
+A parte 1 resolve o problema, mas o worker consulta a tabela a cada ciclo, mesmo sem eventos, e a outbox precisa de limpeza. A parte 2 troca **apenas o transporte**: a gravação atômica e o consumidor idempotente continuam idênticos. O `order-service` não teve nenhuma linha alterada.
+
+```mermaid
+flowchart LR
+    C[Cliente] -->|POST /pagamentos| P[payment-service]
+    subgraph TX[Mesma transação SQL]
+        T1[(pagamentos<br/>APROVADO)]
+        T2[(outbox_events<br/>INSERT + DELETE)]
+    end
+    P --> TX
+    TX -->|commit| WAL[[WAL do PostgreSQL]]
+    WAL -->|replicação lógica| D[Debezium Server<br/>Outbox Event Router]
+    D -->|publica + confirm| R{{RabbitMQ}}
+    R --> O[order-service]
+```
+
+### Como funciona
+
+Todo commit no PostgreSQL é registrado primeiro no **WAL** (Write-Ahead Log). Com `wal_level=logical`, o Debezium se conecta como uma réplica, por meio de um **slot de replicação**, e recebe cada alteração commitada na `outbox_events`. Isso é **CDC (Change Data Capture)**: o banco avisa o que mudou, em vez de alguém perguntar a cada 2 segundos.
+
+O **Outbox Event Router** do Debezium transforma cada `INSERT` na outbox em uma mensagem contendo apenas o `payload`, publicada no mesmo exchange e routing key usados na parte 1.
+
+### A tabela sempre vazia
+
+O Debezium lê o histórico (o WAL), não o estado da tabela. Por isso, no modo `debezium`, o evento é **inserido e apagado na mesma transação**:
+
+```java
+@Transactional(propagation = Propagation.MANDATORY)
+public void registrar(OutboxEvent evento) {
+    if (!modoDebezium) {
+        repository.save(evento);          // o worker lê depois
+        return;
+    }
+    OutboxEvent salvo = repository.saveAndFlush(evento); // INSERT vai para o WAL
+    repository.delete(salvo);                            // DELETE no commit
+}
+```
+
+- O `INSERT` fica no WAL e é publicado; o `DELETE` é ignorado pelo Event Router. A tabela termina vazia, sem coluna de status e sem job de limpeza.
+- O **`saveAndFlush` é obrigatório**. Com `save` + `delete` antes de um flush, o Hibernate cancela as duas operações, nenhum SQL é executado e o evento nunca chega ao WAL: o pagamento é salvo e nenhum evento sai.
+- **`Propagation.MANDATORY`** impede que o método seja chamado fora de uma transação, o que quebraria a atomicidade silenciosamente.
+- Se a transação falhar, nem o `INSERT` nem o `DELETE` chegam ao WAL, e nenhum evento é publicado.
+
+### Configuração
+
+O modo é escolhido no `application.yml` do `payment-service`. No modo `debezium`, o `OutboxPublisher` nem é criado (`@ConditionalOnProperty`).
+
+```yaml
+outbox:
+  publicacao:
+    modo: debezium   # polling | debezium
+```
+
+O Debezium Server roda no Docker Compose, configurado em [`debezium/application.properties`](debezium/application.properties). Os pontos principais:
+
+| Configuração | Por quê |
+|---|---|
+| `wal_level=logical` no PostgreSQL | permite a replicação lógica que o Debezium usa |
+| `table.include.list=public.outbox_events` | captura só a outbox, não a tabela de pagamentos |
+| `snapshot.mode=no_data` | não reenvia linhas que já existiam ao conectar |
+| `transforms=outbox` (EventRouter) | publica só o `payload` como corpo da mensagem |
+| `table.expand.json.payload=true` | o payload é `TEXT`; sem isso, o JSON sairia como string escapada |
+| `sink.type=rabbitmq` + `ackTimeout` | publica no RabbitMQ aguardando o publisher confirm |
+
+### Na prática
+
+Com o worker desligado, o `payment-service` não registra nenhuma publicação; quem leva o evento é o Debezium:
+
+```
+[debezium]      CREATE PUBLICATION dbz_publication FOR TABLE "public"."outbox_events"
+[debezium]      Creating replication slot ... "debezium" LOGICAL pgoutput
+[debezium]      Starting streaming / Processing messages
+[order-service] Pedido aa54d02f-... marcado como PAGO (evento 76c0e6e1-...)
+```
+
+E a outbox continua vazia depois do fluxo:
+
+```
+payment=# select count(*) from outbox_events;
+ count
+-------
+     0
+```
+
+### Polling x CDC
+
+| | Polling (parte 1) | CDC com Debezium (parte 2) |
+|---|---|---|
+| Latência | até o intervalo do ciclo (~2s) | quase imediata |
+| Carga no banco | um `SELECT` por ciclo, mesmo sem eventos | lê o WAL, sem consultar a tabela |
+| Status na outbox | necessário (`PENDENTE`/`PUBLICADO`) | dispensável |
+| Limpeza da tabela | job agendado com retenção | insert + delete na mesma transação |
+| Infraestrutura | só a aplicação | um serviço a mais (Debezium Server) |
+| Garantia de entrega | at-least-once | at-least-once |
+| Consumidor idempotente | necessário | necessário |
+| Risco operacional | worker parado acumula linhas na tabela | Debezium parado faz o PostgreSQL reter WAL (disco do banco pode encher) |
+
 ## As garantias, na prática
 
 **O evento sobrevive ao broker fora do ar.** RabbitMQ parado durante a publicação, depois reiniciado:
@@ -117,14 +223,14 @@ As três garantias são cobertas por testes de integração com Testcontainers (
 | `deveProcessarEventoDuplicadoApenasUmaVez` | idempotência no consumidor |
 | `deveDescartarEventoDePedidoInexistenteSemRegistrarComoProcessado` | tratamento de poison message |
 
-Nos testes, o agendamento é desligado (`outbox.agendamento.habilitado=false`) e o worker é acionado manualmente, para que o resultado não dependa de timing.
+Nos testes, o agendamento é desligado (`outbox.agendamento.habilitado=false`), o modo é fixado em `polling` e o worker é acionado manualmente, para que o resultado não dependa de timing.
 
 ## Como rodar
 
 Pré-requisitos: Java 21 e Docker.
 
 ```bash
-# infraestrutura
+# infraestrutura (PostgreSQL x2, RabbitMQ e Debezium Server)
 docker compose up -d
 
 # serviços (em terminais separados)
@@ -144,11 +250,13 @@ curl -X POST localhost:8081/pagamentos \
   -H "Content-Type: application/json" \
   -d '{"pedidoId": "<ID_DO_PEDIDO>", "valor": 150.00}'
 
-# 3. consultar o pedido (status PAGO em até ~2s)
+# 3. consultar o pedido (status PAGO)
 curl localhost:8082/pedidos/<ID_DO_PEDIDO>
 ```
 
-Painel do RabbitMQ: http://localhost:15672 (guest/guest).
+Painel do RabbitMQ: http://localhost:15672 (guest/guest). Logs do Debezium: `docker compose logs -f debezium`.
+
+Para usar a versão com polling, troque `outbox.publicacao.modo` para `polling` e reinicie o `payment-service` (o Debezium pode ficar parado: `docker compose stop debezium`).
 
 Testes:
 
@@ -159,13 +267,15 @@ cd order-service   && ./mvnw test
 
 ## Trade-offs
 
-- **Latência:** o evento chega com até ~2s de atraso (o intervalo do polling), em troca de nunca se perder.
+- **Latência:** no polling, o evento chega com até ~2s de atraso (o intervalo do ciclo); com CDC, praticamente sem atraso.
 - **At-least-once:** duplicatas são possíveis por design; todo consumidor precisa ser idempotente.
-- **Carga no banco:** o polling consulta a outbox a cada ciclo, mesmo sem eventos pendentes.
-- **Retenção:** guardar eventos publicados facilita auditoria e reprocessamento, mas exige limpeza para a tabela não crescer indefinidamente.
+- **Carga no banco:** o polling consulta a outbox a cada ciclo, mesmo sem eventos pendentes; o CDC não consulta a tabela.
+- **Retenção:** no polling, guardar eventos publicados facilita auditoria e reprocessamento, mas exige limpeza. Com CDC a tabela fica vazia, e o histórico passa a depender do broker ou de logs.
+- **Operação do CDC:** o Debezium é mais um serviço para monitorar. Se ficar parado, o slot de replicação faz o PostgreSQL reter WAL até ele voltar.
 
 ## Próximos passos
 
-- Substituir o polling por **CDC com Debezium**, lendo o WAL do PostgreSQL: menor latência, sem consultas periódicas e sem necessidade de status na outbox.
+- Testes de integração do modo `debezium` (Testcontainers com PostgreSQL em `wal_level=logical` e Debezium Server).
+- Monitorar o atraso do slot de replicação (`pg_replication_slots`) e limitar a retenção de WAL (`max_slot_wal_keep_size`).
 - **Dead Letter Queue** para eventos rejeitados, em vez de descartá-los.
 - Métricas de eventos pendentes e idade do evento mais antigo, para alertar quando o broker ficar indisponível.
